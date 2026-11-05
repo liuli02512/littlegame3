@@ -1,4 +1,4 @@
-# randseed-workflow-version: 8
+# randseed-workflow-version: 11
 name: Deploy to RandSeed Sandbox
 
 on:
@@ -24,6 +24,9 @@ on:
           - dev
           - test
           - production
+  repository_dispatch:
+    types:
+        - randseed-sdk-release
 
 permissions:
   contents: read
@@ -31,6 +34,7 @@ permissions:
 
 jobs:
   build-and-deploy:
+    if: github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
       id-token: write
@@ -321,8 +325,21 @@ jobs:
           function walk(dir) { for (const entry of fs.readdirSync(dir, { withFileTypes: true })) { const full = path.join(dir, entry.name); if (entry.isDirectory()) walk(full); else { const relative = path.relative(root, full).split(path.sep).join('/'); const bytes = fs.readFileSync(full); files.push({ path: relative, sha256: crypto.createHash('sha256').update(bytes).digest('hex'), size: bytes.length }); } } }
           walk(root); files.sort((a, b) => a.path.localeCompare(b.path));
           const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+          const manifest = { deployment_id: process.env.DEPLOYMENT_ID, commit_sha: process.env.COMMIT_SHA, root, files, total_bytes: totalBytes };
+          const definitionPath = path.resolve('randseed.game-definition.json');
+          if (fs.existsSync(definitionPath)) {
+            const stat = fs.lstatSync(definitionPath);
+            if (!stat.isFile() || stat.isSymbolicLink()) { console.error('Game definition must be a regular JSON file'); process.exit(1); }
+            if (stat.size > 512 * 1024) { console.error('Game definition file exceeds the 512 KiB limit'); process.exit(1); }
+            let definition;
+            try { definition = JSON.parse(fs.readFileSync(definitionPath, 'utf8')); }
+            catch { console.error('randseed.game-definition.json must contain valid JSON'); process.exit(1); }
+            if (!definition || typeof definition !== 'object' || Array.isArray(definition)) { console.error('Game definition must be a JSON object'); process.exit(1); }
+            if (Buffer.byteLength(JSON.stringify(definition), 'utf8') > 512 * 1024) { console.error('Game definition exceeds the 512 KiB limit'); process.exit(1); }
+            manifest.game_definition = definition;
+          }
           console.error(`RandSeed artifact manifest: ${files.length} files, ${totalBytes} bytes`);
-          console.log(JSON.stringify({ deployment_id: process.env.DEPLOYMENT_ID, commit_sha: process.env.COMMIT_SHA, root, files, total_bytes: totalBytes }));
+          console.log(JSON.stringify(manifest));
           NODE
           CAS_HASH=$(node -e "const fs=require('fs'),crypto=require('crypto');const m=fs.readFileSync('/tmp/randseed-manifest.json');console.log(crypto.createHash('sha256').update(m).digest('hex'))")
           printf 'cas_hash=%s\n' "$CAS_HASH" >> "$GITHUB_OUTPUT"
@@ -377,8 +394,122 @@ jobs:
           console.log(`RandSeed browser runtime validation passed: ${files.length} files, ${totalBytes} bytes, root ${root}`);
           NODE
 
+      - name: Generate SDK adoption report
+        id: sdk_adoption_report
+        continue-on-error: true
+        env:
+          DEPLOYMENT_ID: ${{ inputs.deployment_id }}
+          GAME_ID: ${{ inputs.game_id }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          IS_FULLSTACK: ${{ steps.detect_mode.outputs.is_fullstack }}
+          SDK_REPORT_PATH: /tmp/randseed-sdk-adoption-report.json
+        run: |
+          set -Eeuo pipefail
+          node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const sourceExtensions = new Set(['.cjs', '.html', '.htm', '.js', '.jsx', '.mjs', '.mts', '.rs', '.ts', '.tsx']);
+          const excludedDirectories = new Set([
+            '.git', '.next', '.nuxt', '.turbo', 'build', 'coverage', 'dist', 'docs',
+            'examples', 'fixtures', 'node_modules', 'target', 'test', 'tests',
+            'vendor', '__tests__',
+          ]);
+          let scanIncomplete = false;
+          const definitions = [
+            { id: 'browser.runtime_client', label: 'RuntimeClient integration', scope: 'browser', pattern: /\bRuntimeClient\b/ },
+            { id: 'browser.runtime_handshake', label: 'Runtime protocol handshake', scope: 'browser', detect: files => {
+              for (const file of files) {
+                const names = [...file.content.matchAll(/\b(?:const|let|var)\s+([\w$]+)\s*=\s*new\s+RuntimeClient\s*\(/g)].map(match => match[1]);
+                if (names.some(name => new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\.\\s*connect\\s*\\(`).test(file.content))) {
+                  return [file.path];
+                }
+              }
+              return [];
+            } },
+            { id: 'browser.game_ready', label: 'Game Ready signal', scope: 'browser', pattern: /\.markReady\s*\(/ },
+            { id: 'browser.viewport', label: 'Runtime viewport', scope: 'browser', pattern: /\bsetViewport\s*\(|\bviewport\s*:/ },
+            { id: 'browser.host_capabilities', label: 'Host state, sound, or navigation', scope: 'browser', pattern: /\bgetCapabilities\s*\(|\bonStateChanged\s*\(|\bruntime\.getState\b|\bsound\.setMuted\b|\bnavigation\.goHome\b/ },
+            { id: 'browser.save_read', label: 'Cloud save read', scope: 'browser', pattern: /\.getProgress\s*\(/ },
+            { id: 'browser.save_write_sync', label: 'Cloud save write and sync', scope: 'browser', pattern: /\.saveProgress\s*\(|\.onSyncStatusChanged\s*\(|\.flush\s*\(/ },
+            { id: 'browser.room_client', label: 'RoomClient connection', scope: 'room', pattern: /\bRoomClient\b|\bnew\s+RoomClient\s*\(/ },
+            { id: 'browser.room_snapshot', label: 'Room snapshot validation', scope: 'room', pattern: /\breadRoomSnapshotState\s*\(|\bonSnapshot\s*:/ },
+            { id: 'browser.room_actions', label: 'Room input and lifecycle', scope: 'room', pattern: /\.sendInput\s*\(|\.sendSocketInput\s*\(|\.readyForNextMatch\s*\(/ },
+            { id: 'server.lifecycle', label: 'Server SDK manifest and lifecycle', scope: 'server', pattern: /\bGameServer\b|\bcreateGameServer\s*\(|\brun_game_server\s*\(|\bcreate_game_router\s*\(/ },
+            { id: 'server.results_agent_views', label: 'Server Result Units or Agent player views', scope: 'server', pattern: /\bresultDefinition\b|\bresult_definition\b|\bresultUnits\b|\bresult_units\b|\bagentPlayerContract\b|\bagent_player_contract\b|\bprojectAgentPlayerView\b|\bproject_agent_player_view\b/ },
+          ];
+
+          function collectSources(directory, relativeDirectory = '') {
+            const result = [];
+            for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+              const relativePath = path.posix.join(relativeDirectory, entry.name);
+              const fullPath = path.join(directory, entry.name);
+              if (entry.isDirectory()) {
+                if (!excludedDirectories.has(entry.name)) result.push(...collectSources(fullPath, relativePath));
+                continue;
+              }
+              if (!entry.isFile() || !sourceExtensions.has(path.extname(entry.name).toLowerCase())) continue;
+              if (relativePath.split('/').some(part => excludedDirectories.has(part))) continue;
+              try {
+                if (fs.statSync(fullPath).size > 1024 * 1024) {
+                  scanIncomplete = true;
+                  continue;
+                }
+                result.push({ path: relativePath, content: fs.readFileSync(fullPath, 'utf8') });
+              } catch {
+                scanIncomplete = true;
+              }
+            }
+            return result;
+          }
+
+          function makeReport(fullstack, sources) {
+            const browserFiles = sources.filter(file => /\.(?:cjs|html|htm|js|jsx|mjs|mts|ts|tsx)$/i.test(file.path));
+            const serverFiles = sources.filter(file => /\.(?:cjs|js|mjs|mts|rs|ts|tsx)$/i.test(file.path));
+            const filesByScope = { browser: browserFiles, room: browserFiles, server: serverFiles };
+            const items = definitions.map(definition => {
+              if ((definition.scope === 'room' || definition.scope === 'server') && !fullstack) {
+                return { id: definition.id, mark: 'not_applicable', evidence: [] };
+              }
+              const files = filesByScope[definition.scope];
+              if (files.length === 0) return { id: definition.id, mark: 'not_verifiable', evidence: [] };
+              const evidence = definition.detect
+                ? definition.detect(files)
+                : files.filter(file => definition.pattern.test(file.content)).map(file => file.path).slice(0, 3);
+              return {
+                id: definition.id,
+                mark: evidence.length > 0 ? 'detected' : scanIncomplete ? 'not_verifiable' : 'not_detected',
+                evidence: evidence.slice(0, 3),
+              };
+            });
+            return {
+              schema_version: 1,
+              deployment_id: process.env.DEPLOYMENT_ID,
+              game_id: process.env.GAME_ID,
+              commit_sha: process.env.COMMIT_SHA,
+              items,
+            };
+          }
+
+          try {
+            let fullstack = process.env.IS_FULLSTACK === 'true';
+            const manifestPath = path.resolve('randseed.fullstack.json');
+            if (fullstack && fs.existsSync(manifestPath)) {
+              const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+              fullstack = Boolean(manifest.backend && typeof manifest.backend === 'object');
+            }
+            const report = makeReport(fullstack, collectSources(process.cwd()));
+            fs.writeFileSync(process.env.SDK_REPORT_PATH || reportPath, JSON.stringify(report));
+            console.log(`SDK adoption report generated: ${report.items.length} checklist items`);
+          } catch (error) {
+            console.error(`SDK adoption scan could not verify source: ${error instanceof Error ? error.message : 'unknown error'}`);
+            const fallback = makeReport(process.env.IS_FULLSTACK === 'true', []);
+            fs.writeFileSync(process.env.SDK_REPORT_PATH || reportPath, JSON.stringify(fallback));
+          }
+          NODE
+
       # 步骤 12: 申请 R2 CAS 增量上传会话
       - name: Request upload session
+        id: request_upload
         env:
           RANDSEED_API_URL: ${{ steps.target_environment.outputs.api_url }}
           OIDC_AUDIENCE: ${{ steps.target_environment.outputs.oidc_audience }}
@@ -578,6 +709,7 @@ jobs:
           RUNTIME_TIER: ${{ steps.detect_mode.outputs.runtime_tier || 'lite' }}
           INACTIVITY_TIMEOUT: ${{ steps.detect_mode.outputs.inactivity_timeout || 300 }}
           ENABLE_INTERNET: ${{ steps.detect_mode.outputs.enable_internet || 'false' }}
+          SDK_REPORT_PATH: /tmp/randseed-sdk-adoption-report.json
         run: |
           set -Eeuo pipefail
           node <<'NODE' > /tmp/randseed-composite-manifest.json
@@ -596,6 +728,12 @@ jobs:
               cas_hash: process.env.FRONTEND_CAS_HASH,
             },
           };
+
+          try {
+            payload.sdk_adoption_report = JSON.parse(fs.readFileSync(process.env.SDK_REPORT_PATH, 'utf8'));
+          } catch {
+            console.error('SDK adoption report is unavailable; the deployment will continue without a report');
+          }
 
           if (isFullstack) {
             payload.backend = {
@@ -695,4 +833,296 @@ jobs:
           if [[ "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 300 ]]; then
             echo "RandSeed deployment failure callback failed ($HTTP_STATUS)" >&2
             exit 1
+          fi
+
+  sdk-update:
+    if: github.event_name == 'repository_dispatch' && github.event.action == 'randseed-sdk-release'
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: randseed-sdk-update-${{ github.repository }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Prepare SDK update changes
+        id: sdk_update
+        env:
+          SDK_RELEASE_SOURCE: ${{ github.event.client_payload.source }}
+          SDK_RELEASE_PACKAGE: ${{ github.event.client_payload.package }}
+          SDK_RELEASE_VERSION: ${{ github.event.client_payload.version }}
+          SDK_RELEASE_WORKFLOW_CONTENT: ${{ github.event.client_payload.workflow_content }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { spawnSync } = require('node:child_process');
+
+          function fail(message) {
+            console.error(message);
+            process.exit(1);
+          }
+
+          function run(command, args, options = {}) {
+            const { capture = false, ...spawnOptions } = options;
+            const result = spawnSync(command, args, {
+              cwd: process.cwd(),
+              encoding: 'utf8',
+              stdio: capture ? ['ignore', 'pipe', 'pipe'] : 'inherit',
+              env: process.env,
+              ...spawnOptions,
+            });
+            if (result.error) throw result.error;
+            if (result.status !== 0) {
+              throw new Error(`${command} failed with status ${result.status}`);
+            }
+            return capture ? result.stdout : '';
+          }
+
+          function parseStableVersion(value) {
+            if (typeof value !== 'string' || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(value)) {
+              return null;
+            }
+            return value.split('.').map(Number);
+          }
+
+          function compareVersions(left, right) {
+            const a = parseVersionRequirement(left);
+            const b = parseStableVersion(right);
+            if (!a || !b) throw new Error('SDK registry returned an unsupported stable version.');
+            for (let index = 0; index < 3; index += 1) {
+              if (a.parts[index] !== b[index]) return a.parts[index] - b[index];
+            }
+            return a.prerelease ? -1 : 0;
+          }
+
+          function parseVersionRequirement(value) {
+            if (typeof value !== 'string') return null;
+            const match = value.replace(/^[~^=]/, '').match(
+              /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/,
+            );
+            if (!match) return null;
+            return { parts: match.slice(1, 4).map(Number), prerelease: Boolean(match[4]) };
+          }
+
+          async function getJson(url, label) {
+            const response = await fetch(url, { headers: { 'User-Agent': 'RandSeed-SDK-Updater' } });
+            if (!response.ok) throw new Error(`${label} registry request failed (${response.status}).`);
+            return response.json();
+          }
+
+          function dependencySection(manifest, packageName) {
+            return ['dependencies', 'devDependencies', 'optionalDependencies']
+              .find(section => manifest[section] && Object.hasOwn(manifest[section], packageName));
+          }
+
+          function updateNpmProject(version) {
+            const manifestPath = path.resolve('package.json');
+            if (!fs.existsSync(manifestPath)) return false;
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+            const section = dependencySection(manifest, '@randseed/game-sdk');
+            if (!section) return false;
+            if (manifest.workspaces) {
+              throw new Error('Automatic SDK updates currently require a single-package npm repository.');
+            }
+            if (manifest.packageManager && !manifest.packageManager.startsWith('npm@')) {
+              throw new Error('The game repository uses an unsupported package manager for SDK updates.');
+            }
+            for (const lockfile of ['pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb', 'npm-shrinkwrap.json']) {
+              if (fs.existsSync(lockfile)) {
+                throw new Error(`Automatic SDK updates do not support ${lockfile}.`);
+              }
+            }
+            const existing = manifest[section]['@randseed/game-sdk'];
+            const currentVersion = typeof existing === 'string'
+              ? existing.replace(/^[~^=]/, '')
+              : '';
+            if (!parseVersionRequirement(currentVersion)) {
+              throw new Error('The existing npm SDK dependency must use a supported registry version range.');
+            }
+            if (compareVersions(currentVersion, version) >= 0) return false;
+            const sectionFlag = section === 'devDependencies'
+              ? '--save-dev'
+              : section === 'optionalDependencies'
+                ? '--save-optional'
+                : '--save-prod';
+            run('npm', ['install', '--save-exact', sectionFlag, `@randseed/game-sdk@${version}`]);
+            return true;
+          }
+
+          function cargoDependencyMetadata() {
+            const rootManifest = path.resolve('Cargo.toml');
+            if (!fs.existsSync(rootManifest)) return null;
+            const metadataText = run('cargo', ['metadata', '--no-deps', '--format-version', '1'], { capture: true });
+            const metadata = JSON.parse(metadataText);
+            const packages = metadata.packages.filter(pkg =>
+              pkg.dependencies.some(dependency => dependency.name === 'randseed-game-sdk'));
+            return packages.length ? { rootManifest, metadata, packages } : null;
+          }
+
+          function updateRustProject(version) {
+            const cargo = cargoDependencyMetadata();
+            if (!cargo) return false;
+            for (const pkg of cargo.packages) {
+              const dependency = pkg.dependencies.find(item => item.name === 'randseed-game-sdk');
+              if (dependency.source && !dependency.source.startsWith('registry+https://github.com/rust-lang/crates.io-index')) {
+                throw new Error('Automatic updates only support randseed-game-sdk dependencies from crates.io.');
+              }
+              const args = ['add', '--manifest-path', pkg.manifest_path];
+              if (dependency.kind === 'dev') args.push('--dev');
+              if (dependency.kind === 'build') args.push('--build');
+              if (dependency.target) args.push('--target', dependency.target);
+              if (dependency.optional) args.push('--optional');
+              if (dependency.rename) args.push('--rename', dependency.rename);
+              args.push(`randseed-game-sdk@=${version}`);
+              run('cargo', args);
+            }
+            run('cargo', [
+              'update',
+              '--manifest-path',
+              cargo.rootManifest,
+              '--package',
+              'randseed-game-sdk',
+              '--precise',
+              version,
+            ]);
+            return true;
+          }
+
+          async function main() {
+            const source = process.env.SDK_RELEASE_SOURCE;
+            const packageName = process.env.SDK_RELEASE_PACKAGE;
+            const eventVersion = process.env.SDK_RELEASE_VERSION;
+            const workflowContent = process.env.SDK_RELEASE_WORKFLOW_CONTENT;
+            const expectedPackages = {
+              npm: '@randseed/game-sdk',
+              randseedsdk: 'randseed-game-sdk',
+            };
+            if (expectedPackages[source] !== packageName
+              || !parseStableVersion(eventVersion)
+              || !workflowContent
+              || workflowContent.length > 65000
+              || !/^# randseed-workflow-version: (?:1[1-9]|[2-9]\d+)\s*$/m.test(workflowContent)) {
+              fail('The SDK release dispatch payload is invalid.');
+            }
+
+            if (source === 'npm') {
+              const eventMetadata = await getJson(
+                `https://registry.npmjs.org/@randseed%2fgame-sdk/${eventVersion}`,
+                'npm',
+              );
+              if (eventMetadata.name !== packageName || eventMetadata.version !== eventVersion) {
+                fail('The npm SDK release is not available in the registry.');
+              }
+            } else {
+              const eventMetadata = await getJson(
+                `https://crates.io/api/v1/crates/randseed-game-sdk/${eventVersion}`,
+                'crates.io',
+              );
+              if (eventMetadata.version?.crate !== packageName
+                || eventMetadata.version?.num !== eventVersion
+                || eventMetadata.version?.yanked === true) {
+                fail('The Rust SDK release is not available in crates.io.');
+              }
+            }
+
+            const npmMetadata = await getJson('https://registry.npmjs.org/@randseed%2fgame-sdk/latest', 'npm');
+            let npmVersion = npmMetadata.version;
+            if (!parseStableVersion(npmVersion)) fail('npm latest does not point to a stable SDK version.');
+            if (source === 'npm' && compareVersions(eventVersion, npmVersion) > 0) {
+              npmVersion = eventVersion;
+            }
+
+            const cratesMetadata = await getJson('https://crates.io/api/v1/crates/randseed-game-sdk', 'crates.io');
+            let rustVersion = cratesMetadata.crate?.max_stable_version;
+            if (!parseStableVersion(rustVersion)) fail('crates.io did not return a stable SDK version.');
+            if (source === 'randseedsdk' && compareVersions(eventVersion, rustVersion) > 0) {
+              rustVersion = eventVersion;
+            }
+
+            const branch = 'randseed/sdk-updates';
+            run('git', ['checkout', '-B', branch, process.env.GITHUB_SHA]);
+            const npmUpdated = updateNpmProject(npmVersion);
+            const rustUpdated = updateRustProject(rustVersion);
+            if (!npmUpdated && !rustUpdated) {
+              console.log('No declared RandSeed SDK dependency needs an update.');
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, 'pull_request_needed=false\n');
+              return;
+            }
+
+            const workflowPath = '.github/workflows/randseed-deploy.yml';
+            fs.mkdirSync(path.dirname(workflowPath), { recursive: true });
+            fs.writeFileSync(workflowPath, workflowContent.endsWith('\n') ? workflowContent : `${workflowContent}\n`);
+
+            run('git', ['add', '-A']);
+            const changedFiles = run('git', ['diff', '--cached', '--name-only'], { capture: true })
+              .split(/\r?\n/).filter(Boolean);
+            const allowedPath = file =>
+              file === workflowPath
+              || file === 'package.json'
+              || file === 'package-lock.json'
+              || file === 'Cargo.toml'
+              || file === 'Cargo.lock'
+              || /^.+\/Cargo\.toml$/.test(file)
+              || /^.+\/Cargo\.lock$/.test(file);
+            if (changedFiles.some(file => !allowedPath(file))) {
+              fail('The SDK updater changed an unexpected file; refusing to create a pull request.');
+            }
+            if (changedFiles.length === 0) {
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, 'pull_request_needed=false\n');
+              return;
+            }
+
+            const title = 'Update RandSeed SDK dependencies and deployment workflow';
+            run('git', ['config', 'user.name', 'github-actions[bot]']);
+            run('git', ['config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com']);
+            run('git', ['-c', 'core.hooksPath=/dev/null', 'commit', '-m', title]);
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, 'pull_request_needed=true\n');
+          }
+
+          main().catch(error => fail(error instanceof Error ? error.message : 'SDK update failed.'));
+          NODE
+
+      - name: Push SDK update branch and open pull request
+        if: steps.sdk_update.outputs.pull_request_needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SDK_UPDATE_BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          SDK_UPDATE_REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ ! "$SDK_UPDATE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Invalid GitHub repository context" >&2
+            exit 1
+          fi
+          branch="randseed/sdk-updates"
+          git remote set-url origin "https://github.com/$SDK_UPDATE_REPOSITORY.git"
+          git -c core.hooksPath=/dev/null -c credential.helper= -c 'credential.helper=!gh auth git-credential' ls-remote --heads origin "$branch" > "$RUNNER_TEMP/randseed-sdk-branch"
+          if [[ -s "$RUNNER_TEMP/randseed-sdk-branch" ]]; then
+            git -c core.hooksPath=/dev/null -c credential.helper= -c 'credential.helper=!gh auth git-credential' fetch origin "+refs/heads/$branch:refs/remotes/origin/$branch"
+          fi
+          git -c core.hooksPath=/dev/null -c credential.helper= -c 'credential.helper=!gh auth git-credential' push --force-with-lease origin "HEAD:refs/heads/$branch"
+
+          title="Update RandSeed SDK dependencies and deployment workflow"
+          body=$'This pull request updates already-declared RandSeed SDK dependencies and lockfiles to the latest stable registry versions.\nIt also refreshes `.github/workflows/randseed-deploy.yml` from the trusted SDK release dispatch.\n\nReview and merge this pull request manually. It does not deploy or merge automatically.'
+          pull_requests=$(gh pr list --state open --head "$branch" --base "$SDK_UPDATE_BASE_BRANCH" --json number)
+          pull_request_number=$(node -e 'const list = JSON.parse(process.argv[1]); if (list.length) process.stdout.write(String(list[0].number));' "$pull_requests")
+          if [[ -n "$pull_request_number" ]]; then
+            gh pr edit "$pull_request_number" --title "$title" --body "$body"
+          else
+            gh pr create --base "$SDK_UPDATE_BASE_BRANCH" --head "$branch" --title "$title" --body "$body"
           fi
